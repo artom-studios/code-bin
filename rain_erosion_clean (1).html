@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rain Erosion Demo</title>
+
+<style>
+  :root {
+    --bg: #e9e8e5;
+    --panel: #f6f5f2;
+    --text: #222;
+    --muted: #6b6a66;
+    --border: #d3d1cb;
+    --accent: #3a5f8a;
+    color-scheme: light;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15161a; --panel: #1d1f24; --text: #e4e4e0;
+      --muted: #979690; --border: #33353b; --accent: #86aedb;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15161a; --panel: #1d1f24; --text: #e4e4e0;
+    --muted: #979690; --border: #33353b; --accent: #86aedb;
+    color-scheme: dark;
+  }
+
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 Georgia, "Times New Roman", serif;
+  }
+
+  #app { display: flex; height: 100%; }
+
+  #viewport { flex: 1; position: relative; min-width: 0; }
+  #viewport canvas { display: block; width: 100%; height: 100%; }
+
+  #stats {
+    position: absolute; left: 14px; top: 12px;
+    color: var(--muted);
+    font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre;
+  }
+
+  #panel {
+    width: 270px;
+    box-sizing: border-box;
+    padding: 14px;
+    overflow-y: auto;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+  }
+  #panel h1 { font-size: 18px; margin: 0 0 2px; font-weight: 600; }
+  #panel h2 { font-size: 13px; margin: 14px 0 2px; font-weight: 600; }
+  #panel .note { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+
+  .button-row { display: flex; gap: 6px; margin-bottom: 10px; }
+
+  button, input[type=number], select {
+    font: inherit;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 9px;
+  }
+  button { flex: 1; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  input[type=number], select { width: 100%; box-sizing: border-box; margin-top: 2px; }
+
+  label { display: block; margin: 7px 0; font-size: 12px; }
+  label span { display: flex; justify-content: space-between; color: var(--muted); }
+  input[type=range] { width: 100%; margin: 2px 0 0; accent-color: var(--accent); }
+
+  @media (max-width: 720px) {
+    #app { flex-direction: column; }
+    #panel { width: auto; height: 42%; border-left: 0; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+
+<body>
+<div id="app">
+  <div id="viewport"><div id="stats"></div></div>
+
+  <div id="panel">
+    <h1>Rain erosion</h1>
+    <p class="note">Three passes per iteration: 625 particles at 256, 2,500 at 512,
+      then 10,000 at 1024. Runs on the CPU.</p>
+
+    <div class="button-row">
+      <button class="primary" id="play">Pause</button>
+      <button id="step">Step</button>
+      <button id="reset">Reset</button>
+    </div>
+
+    <label><span>Preset</span>
+      <select id="preset"><option value="custom" hidden>Custom</option></select>
+    </label>
+    <label><span>Seed</span><input type="number" id="seed" value="1"></label>
+    <label><span>View</span>
+      <select id="viewMode">
+        <option value="0">Final</option>
+        <option value="1">256 layer only</option>
+        <option value="2">256 + 512 layers</option>
+        <option value="3">Channels only</option>
+      </select>
+    </label>
+
+    <h2>Terrain</h2>   <div id="terrainSliders"></div>
+    <h2>Particles</h2> <div id="particleSliders"></div>
+    <h2>Surface</h2>   <div id="surfaceSliders"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+/* =====================================================================
+   RAIN EROSION, THREE-LEVEL VERSION
+
+   Three maps of different resolution share one terrain:
+
+     base (256)  : the broad shape. Only pass 1 edits it.
+     mid  (512)  : upscale(base)  + channels(detailMid)
+     fine (1024) : upscale(mid)   + channels(detailFine)   <- what you see
+
+   Each finer pass carves on the combined surface, records every change
+   in its own detail layer, then keeps only the NARROW part of that
+   layer ("channels" = detail minus a blurred copy of detail). Wide
+   changes are discarded, so only the coarsest pass shapes the big forms.
+   ===================================================================== */
+
+const FINE = 1024, MID = 512, BASE = 256;
+
+
+/* ---------------------------------------------------------------------
+   1. SETTINGS AND SLIDERS
+   --------------------------------------------------------------------- */
+
+const cfg = {};         // current value of every setting, filled by makeSliders()
+const sliderEls = {};   // the slider and readout elements, so presets can set them
+
+// { key, label, min, max, step, value }
+function makeSliders(list, host, onChange) {
+  for (const s of list) {
+    cfg[s.key] = s.value;
+    const label = document.createElement('label');
+    label.innerHTML =
+      `<span>${s.label}<b>${s.value}</b></span>` +
+      `<input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${s.value}">`;
+    const input = label.querySelector('input');
+    const readout = label.querySelector('b');
+    sliderEls[s.key] = { input, readout };
+    input.oninput = () => {
+      cfg[s.key] = +input.value;
+      readout.textContent = input.value;
+      document.getElementById('preset').value = 'custom';
+      if (onChange) onChange(s.key);
+    };
+    host.appendChild(label);
+  }
+}
+const $ = id => document.getElementById(id);
+
+makeSliders([
+  { key: 'spawnFlat',        label: 'Spawn flat threshold',  min: .001, max: .2,  step: .001, value: .02 },
+  { key: 'lookRadius',       label: 'Look radius',           min: 1,    max: 8,   step: .5,   value: 3 },
+  { key: 'lookSamples',      label: 'Look samples',          min: 4,    max: 16,  step: 1,    value: 8 },
+  { key: 'jitter',           label: 'Steering jitter (deg)', min: 0,    max: 60,  step: 1,    value: 20 },
+  { key: 'inertia',          label: 'Inertia',               min: 0,    max: .95, step: .05,  value: .3 },
+  { key: 'speedGain',        label: 'Speed gain',            min: .5,   max: 20,  step: .5,   value: 4 },
+  { key: 'minSpeed',         label: 'Min speed',             min: .1,   max: 2,   step: .1,   value: .5 },
+  { key: 'maxSpeed',         label: 'Max speed',             min: .5,   max: 5,   step: .1,   value: 2 },
+  { key: 'capacityPerSlope', label: 'Capacity per slope',    min: .1,   max: 10,  step: .1,   value: 1 },
+  { key: 'maxCapacity',      label: 'Max capacity',          min: .1,   max: 10,  step: .1,   value: 1 },
+  { key: 'pickupRate',       label: 'Pickup rate',           min: 0,    max: 1,   step: .05,  value: .3 },
+  { key: 'dropRate',         label: 'Drop rate',             min: 0,    max: 1,   step: .05,  value: .3 },
+  { key: 'brushRadius',      label: 'Brush radius',          min: 1,    max: 8,   step: .5,   value: 3 },
+  { key: 'maxSteps',         label: 'Max steps',             min: 8,    max: 256, step: 8,    value: 64 },
+], $('particleSliders'));
+
+// Terrain sliders regenerate the map (debounced). Plane size only rescales the mesh.
+let regenerateTimer;
+makeSliders([
+  { key: 'baseFreq',   label: 'Base frequency',          min: 2,   max: 32,  step: 1,   value: 4 },
+  { key: 'lacunarity', label: 'Frequency gain per layer', min: 1.5, max: 3,   step: .1,  value: 2 },
+  { key: 'layers',     label: 'Noise layers',            min: 1,   max: 8,   step: 1,   value: 6 },
+  { key: 'roughness',  label: 'Layer roughness',         min: .2,  max: .8,  step: .05, value: .5 },
+  { key: 'height',     label: 'Terrain height',          min: 20,  max: 400, step: 5,   value: 200 },
+  { key: 'planeSize',  label: 'Plane size',              min: 50,  max: 200, step: 5,   value: 100 },
+], $('terrainSliders'), key => {
+  if (key === 'planeSize') { mesh.scale.setScalar(cfg.planeSize / 100); return; }
+  clearTimeout(regenerateTimer);
+  regenerateTimer = setTimeout(resetSimulation, 150);
+});
+
+
+/* ---------------------------------------------------------------------
+   2. DATA
+   --------------------------------------------------------------------- */
+
+const newFine = () => new Float32Array(FINE * FINE);
+const newMid  = () => new Float32Array(MID * MID);
+
+// The three surfaces. Heights are in each map's own pixel units, so
+// base heights are 1/4 of fine heights and mid heights are 1/2.
+const base = new Float32Array(BASE * BASE);
+const mid  = newMid();
+const fine = newFine();
+
+// Detail layers record what each finer pass changed; channels are their narrow part.
+const detailMid  = newMid(),  chanMid  = newMid();
+const detailFine = newFine(), chanFine = newFine();
+
+// Cached upscales, used when rebuilding the surfaces.
+const upMid  = newMid();    // upscale(base)
+const upFine = newFine();   // upscale(mid)
+
+// Scratch buffers.
+const scratchMid  = newMid();
+const scratchFine = newFine();
+const scratchRows = newFine();                       // blur intermediate
+const scratchUp   = new Float32Array(MID * FINE);    // upscale intermediate
+const viewBuffer  = newFine();                       // for the non-final view modes
+
+// Particle processing orders (shuffled every pass).
+const orderBase = new Uint16Array(625);
+const orderMid  = new Uint16Array(2500);
+const orderFine = new Uint16Array(10000);
+
+let random;                 // seeded generator, used for everything
+let iteration = 0;
+let timings = [0, 0, 0, 0]; // ms: pass 256, pass 512, pass 1024, rebuilds
+
+// Small fast seeded PRNG (mulberry32).
+function seededRandom(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+
+/* ---------------------------------------------------------------------
+   3. STARTING TERRAIN
+   Layered value noise. Built in `fine` as scratch, then averaged down
+   into `base`. The finer maps start with no detail and no channels.
+   --------------------------------------------------------------------- */
+
+function generateTerrain(seed) {
+  random = seededRandom(seed);
+  fine.fill(0);
+
+  let amplitude = 1;
+  for (let layer = 0; layer < cfg.layers; layer++) {
+    const cells = Math.round(cfg.baseFreq * Math.pow(cfg.lacunarity, layer));
+    if (cells > FINE) break;                       // finer than the map can hold
+
+    const lattice = new Float32Array((cells + 1) * (cells + 1));
+    for (let i = 0; i < lattice.length; i++) lattice[i] = random();
+
+    for (let y = 0; y < FINE; y++) {
+      const fy = y / FINE * cells, y0 = fy | 0, ty = fy - y0;
+      const sy = ty * ty * (3 - 2 * ty);           // smoothstep
+      for (let x = 0; x < FINE; x++) {
+        const fx = x / FINE * cells, x0 = fx | 0, tx = fx - x0;
+        const sx = tx * tx * (3 - 2 * tx);
+        const a = lattice[y0 * (cells + 1) + x0],       b = lattice[y0 * (cells + 1) + x0 + 1];
+        const c = lattice[(y0 + 1) * (cells + 1) + x0], d = lattice[(y0 + 1) * (cells + 1) + x0 + 1];
+        fine[y * FINE + x] += amplitude * ((a + (b - a) * sx) * (1 - sy) + (c + (d - c) * sx) * sy);
+      }
+    }
+    amplitude *= cfg.roughness;
+  }
+
+  // Rescale to 0 .. terrain height.
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < fine.length; i++) { lo = Math.min(lo, fine[i]); hi = Math.max(hi, fine[i]); }
+  const scale = cfg.height / (hi - lo);
+  for (let i = 0; i < fine.length; i++) fine[i] = (fine[i] - lo) * scale;
+
+  // base = average of each 4 x 4 block, divided by 4 (height units shrink with size).
+  for (let y = 0; y < BASE; y++) for (let x = 0; x < BASE; x++) {
+    let sum = 0;
+    for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) sum += fine[(4 * y + j) * FINE + 4 * x + i];
+    base[y * BASE + x] = sum / 64;
+  }
+
+  detailMid.fill(0); detailFine.fill(0);
+  chanMid.fill(0);   chanFine.fill(0);
+  upscale(base, BASE, upMid, 2);   addLayers(mid, upMid, chanMid);
+  upscale(mid,  MID,  upFine, 2);  addLayers(fine, upFine, chanFine);
+
+  orderBase.forEach((_, i) => orderBase[i] = i);
+  orderMid.forEach((_, i) => orderMid[i] = i);
+  orderFine.forEach((_, i) => orderFine[i] = i);
+  iteration = 0;
+}
+
+
+/* ---------------------------------------------------------------------
+   4. BUILDING SURFACES
+   --------------------------------------------------------------------- */
+
+// Catmull-Rom weights for the 4 taps around a sample at fraction t.
+function catmullRom(t) {
+  return [
+    -.5 * t * t * t + t * t - .5 * t,
+    1.5 * t * t * t - 2.5 * t * t + 1,
+    -1.5 * t * t * t + 2 * t * t + .5 * t,
+    .5 * t * t * t - .5 * t * t,
+  ];
+}
+// Doubling a map puts each new pixel at a fraction of .75 (even) or .25 (odd)
+// between source pixels, so only two weight sets are needed.
+const UPSCALE_WEIGHTS = [catmullRom(.75), catmullRom(.25)];
+
+// Smooth 2x upscale (separable cubic). `gain` multiplies heights (2 = keep real height).
+function upscale(src, srcSize, dst, gain) {
+  const dstSize = srcSize * 2;
+  const clamp = v => v < 0 ? 0 : v > srcSize - 1 ? srcSize - 1 : v;
+
+  for (let y = 0; y < srcSize; y++) for (let x = 0; x < dstSize; x++) {          // horizontal
+    const odd = x & 1, first = (x >> 1) - (odd ? 0 : 1), w = UPSCALE_WEIGHTS[odd], row = y * srcSize;
+    scratchUp[y * dstSize + x] =
+      src[row + clamp(first - 1)] * w[0] + src[row + clamp(first)]     * w[1] +
+      src[row + clamp(first + 1)] * w[2] + src[row + clamp(first + 2)] * w[3];
+  }
+  for (let y = 0; y < dstSize; y++) {                                              // vertical
+    const odd = y & 1, first = (y >> 1) - (odd ? 0 : 1), w = UPSCALE_WEIGHTS[odd];
+    const r0 = clamp(first - 1) * dstSize, r1 = clamp(first) * dstSize;
+    const r2 = clamp(first + 1) * dstSize, r3 = clamp(first + 2) * dstSize;
+    for (let x = 0; x < dstSize; x++) {
+      dst[y * dstSize + x] = gain * (
+        scratchUp[r0 + x] * w[0] + scratchUp[r1 + x] * w[1] +
+        scratchUp[r2 + x] * w[2] + scratchUp[r3 + x] * w[3]);
+    }
+  }
+}
+
+// Box blur of radius r, rows then columns, edges clamped.
+function boxBlur(src, dst, r, size) {
+  const window = 2 * r + 1, last = size - 1, clamp = v => v < 0 ? 0 : v > last ? last : v;
+  for (let y = 0; y < size; y++) {
+    const row = y * size; let sum = 0;
+    for (let k = -r; k <= r; k++) sum += src[row + clamp(k)];
+    for (let x = 0; x < size; x++) {
+      scratchRows[row + x] = sum / window;
+      sum += src[row + clamp(x + r + 1)] - src[row + clamp(x - r)];
+    }
+  }
+  for (let x = 0; x < size; x++) {
+    let sum = 0;
+    for (let k = -r; k <= r; k++) sum += scratchRows[clamp(k) * size + x];
+    for (let y = 0; y < size; y++) {
+      dst[y * size + x] = sum / window;
+      sum += scratchRows[clamp(y + r + 1) * size + x] - scratchRows[clamp(y - r) * size + x];
+    }
+  }
+}
+
+// channels = detail - (detail blurred twice). Broad changes cancel; narrow grooves remain.
+function extractChannels(detail, channels, tmp, size) {
+  const r = cfg.cutoff | 0;
+  boxBlur(detail, tmp, r, size);
+  boxBlur(tmp, channels, r, size);
+  for (let i = 0; i < size * size; i++) channels[i] = detail[i] - channels[i];
+}
+
+// surface = max(0, upscaled level below + channels)
+function addLayers(out, upscaled, channels) {
+  for (let i = 0; i < out.length; i++) {
+    const v = upscaled[i] + channels[i];
+    out[i] = v > 0 ? v : 0;
+  }
+}
+
+// Used when the cutoff slider changes.
+function rebuildAll() {
+  extractChannels(detailMid, chanMid, scratchMid, MID);
+  addLayers(mid, upMid, chanMid);
+  upscale(mid, MID, upFine, 2);
+  extractChannels(detailFine, chanFine, scratchFine, FINE);
+  addLayers(fine, upFine, chanFine);
+}
+
+
+/* ---------------------------------------------------------------------
+   5. PARTICLES
+   One routine runs on any map. `detail`, if given, receives every edit too.
+   --------------------------------------------------------------------- */
+
+let map = fine, mapSize = FINE, detail = null;   // the map the routine is working on
+
+// Height at a real-valued position: bilinear blend, edges clamped.
+function sampleHeight(x, y) {
+  const last = mapSize - 1;
+  x = x < 0 ? 0 : x > last ? last : x;
+  y = y < 0 ? 0 : y > last ? last : y;
+  const x0 = x | 0, y0 = y | 0;
+  const x1 = x0 < last ? x0 + 1 : x0, y1 = y0 < last ? y0 + 1 : y0;
+  const tx = x - x0, ty = y - y0, row0 = y0 * mapSize, row1 = y1 * mapSize;
+  return (map[row0 + x0] * (1 - tx) + map[row0 + x1] * tx) * (1 - ty) +
+         (map[row1 + x0] * (1 - tx) + map[row1 + x1] * tx) * ty;
+}
+
+// Outputs of measureSlope().
+let slope = 0, downX = 0, downY = 0, hereHeight = 0, lowestHeight = 0;
+let ringCos = [], ringSin = [];
+
+function buildRing() {
+  ringCos = []; ringSin = [];
+  for (let k = 0; k < cfg.lookSamples; k++) {
+    const angle = k / cfg.lookSamples * Math.PI * 2;
+    ringCos.push(Math.cos(angle)); ringSin.push(Math.sin(angle));
+  }
+}
+
+// Looks at a ring around (x, y). Slope = drop to the lowest point / look radius.
+// If nothing on the ring is lower (flat ground or a pit), slope = 0 and the
+// previous downhill direction is left untouched.
+function measureSlope(x, y) {
+  hereHeight = sampleHeight(x, y);
+  let best = hereHeight, bestIndex = -1;
+  for (let k = 0; k < ringCos.length; k++) {
+    const h = sampleHeight(x + ringCos[k] * cfg.lookRadius, y + ringSin[k] * cfg.lookRadius);
+    if (h < best) { best = h; bestIndex = k; }
+  }
+  if (bestIndex < 0) { slope = 0; lowestHeight = hereHeight; return; }
+  slope = (hereHeight - best) / cfg.lookRadius;
+  lowestHeight = best;
+  downX = ringCos[bestIndex]; downY = ringSin[bestIndex];
+}
+
+// Soft brush: spreads `amount` over nearby cells, weight (1 - d/R)^2 normalised to 1.
+// remove = true takes height away (never below 0) and returns what was really removed.
+const brushWeights = new Float32Array(1024);
+function applyBrush(x, y, amount, remove) {
+  const R = cfg.brushRadius;
+  const x0 = Math.max(0, Math.ceil(x - R)), x1 = Math.min(mapSize - 1, Math.floor(x + R));
+  const y0 = Math.max(0, Math.ceil(y - R)), y1 = Math.min(mapSize - 1, Math.floor(y + R));
+
+  let total = 0, n = 0;
+  for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) {
+    const d = Math.hypot(xx - x, yy - y);
+    let w = 0;
+    if (d < R) { w = 1 - d / R; w *= w; }
+    brushWeights[n++] = w; total += w;
+  }
+  if (total <= 0) return 0;
+
+  let removed = 0; n = 0;
+  for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) {
+    const w = brushWeights[n++];
+    if (w === 0) continue;
+    const part = amount * w / total, i = yy * mapSize + xx;
+    if (remove) {
+      const taken = part < map[i] ? part : map[i];
+      map[i] -= taken; removed += taken;
+      if (detail) detail[i] -= taken;
+    } else {
+      map[i] += part;
+      if (detail) detail[i] += part;
+    }
+  }
+  return removed;
+}
+
+// One pass: one particle per grid cell (grid x grid), random spot in each cell,
+// processed in random order, each seeing the edits of the ones before it.
+function runPass(targetMap, size, grid, order, targetDetail) {
+  map = targetMap; mapSize = size; detail = targetDetail;
+  const count = grid * grid, cellSize = size / grid;
+  const jitterRad = cfg.jitter * Math.PI / 180;
+
+  for (let i = count - 1; i > 0; i--) {                  // shuffle
+    const j = (random() * (i + 1)) | 0;
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  for (let q = 0; q < count; q++) {
+    const p = order[q];
+    let x = ((p % grid) + random()) * cellSize;
+    let y = (((p / grid) | 0) + random()) * cellSize;
+
+    // Flatness only matters here: a particle that spawns on flat ground is discarded.
+    measureSlope(x, y);
+    if (slope < cfg.spawnFlat) continue;
+
+    let sediment = 0, velX = 0, velY = 0, firstStep = true, finished = false;
+
+    for (let step = 0; step < cfg.maxSteps; step++) {
+      measureSlope(x, y);
+
+      // Steer: blend old heading with downhill, then add jitter.
+      // First step has no heading yet; on flat ground there is no downhill, so keep going straight.
+      let dirX, dirY;
+      if (firstStep)                   { dirX = downX; dirY = downY; firstStep = false; }
+      else if (slope < cfg.spawnFlat)  { dirX = velX;  dirY = velY; }
+      else {
+        dirX = cfg.inertia * velX + (1 - cfg.inertia) * downX;
+        dirY = cfg.inertia * velY + (1 - cfg.inertia) * downY;
+      }
+      const angle = (random() * 2 - 1) * jitterRad, c = Math.cos(angle), s = Math.sin(angle);
+      let rotX = dirX * c - dirY * s, rotY = dirX * s + dirY * c, length = Math.hypot(rotX, rotY);
+      if (length < 1e-6) { rotX = downX; rotY = downY; length = 1; }
+      velX = rotX / length; velY = rotY / length;
+
+      const speed    = Math.min(cfg.maxSpeed, Math.max(cfg.minSpeed, slope * cfg.speedGain));
+      const capacity = Math.min(cfg.maxCapacity, Math.max(0, slope * cfg.capacityPerSlope));
+
+      if (sediment > capacity) {
+        // Carrying too much for this slope: drop part of the excess.
+        const dropped = (sediment - capacity) * cfg.dropRate;
+        applyBrush(x, y, dropped, false);
+        sediment -= dropped;
+      } else {
+        // Spare capacity: pick up, but never more than the drop to the lowest neighbour.
+        const wanted = Math.min((capacity - sediment) * cfg.pickupRate, hereHeight - lowestHeight);
+        if (wanted > 0) sediment += applyBrush(x, y, wanted, true);
+      }
+
+      x += velX * speed; y += velY * speed;
+      if (x < 0 || x > size - 1 || y < 0 || y > size - 1) { finished = true; sediment = 0; break; }  // left the map
+    }
+
+    if (!finished && sediment > 0) applyBrush(x, y, sediment, false);   // ran out of steps: drop the rest
+  }
+}
+
+// One full iteration: three passes, with the surfaces rebuilt between them.
+function runIteration() {
+  buildRing();
+  const t = [performance.now()];
+
+  runPass(base, BASE, 25, orderBase, null);                         // pass 1: 256, edits base
+  t.push(performance.now());
+  upscale(base, BASE, upMid, 2); addLayers(mid, upMid, chanMid);
+  t.push(performance.now());
+
+  runPass(mid, MID, 50, orderMid, detailMid);                       // pass 2: 512, edits mid + detailMid
+  t.push(performance.now());
+  extractChannels(detailMid, chanMid, scratchMid, MID);
+  addLayers(mid, upMid, chanMid);
+  upscale(mid, MID, upFine, 2);
+  addLayers(fine, upFine, chanFine);
+  t.push(performance.now());
+
+  runPass(fine, FINE, 100, orderFine, detailFine);                  // pass 3: 1024, edits fine + detailFine
+  t.push(performance.now());
+  extractChannels(detailFine, chanFine, scratchFine, FINE);
+  addLayers(fine, upFine, chanFine);
+  t.push(performance.now());
+
+  timings = [t[1] - t[0], t[3] - t[2], t[5] - t[4], (t[2] - t[1]) + (t[4] - t[3]) + (t[6] - t[5])];
+  iteration++;
+}
+
+
+/* ---------------------------------------------------------------------
+   6. 3D CLAY VIEW
+   The height map is a float texture. The vertex shader lifts a 512 x 512
+   grid by it; the fragment shader rebuilds normals from the full 1024
+   texture so fine channels show even though the mesh is coarser.
+   --------------------------------------------------------------------- */
+
+const viewport = $('viewport'), statsEl = $('stats');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+viewport.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, 1, 1, 1000);
+camera.position.set(0, 85, 105);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.target.set(0, 5, 0);
+
+const heightTexture = new THREE.DataTexture(fine, FINE, FINE, THREE.RedFormat, THREE.FloatType);
+heightTexture.minFilter = heightTexture.magFilter = THREE.NearestFilter;
+heightTexture.generateMipmaps = false;
+
+const PLANE = 100;                       // plane width in world units
+const uniforms = { heightTex: { value: heightTexture }, exaggeration: { value: 2 } };
+
+const material = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: `
+    uniform sampler2D heightTex;
+    uniform float exaggeration;
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      vec3 p = position;
+      p.z = texture2D(heightTex, uv).r * exaggeration * ${(PLANE / FINE).toFixed(6)};
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    }`,
+  fragmentShader: `
+    uniform sampler2D heightTex;
+    uniform float exaggeration;
+    varying vec2 vUv;
+
+    float heightAt(vec2 texelOffset) {
+      return texture2D(heightTex, vUv + texelOffset / 1024.0).r;
+    }
+
+    void main() {
+      float centre = heightAt(vec2(0.0));
+
+      // Surface normal from height differences (object space is z-up).
+      float dx = (heightAt(vec2(1.0, 0.0)) - heightAt(vec2(-1.0, 0.0))) * 0.5 * exaggeration;
+      float dy = (heightAt(vec2(0.0, 1.0)) - heightAt(vec2(0.0, -1.0))) * 0.5 * exaggeration;
+      vec3 n = normalize(vec3(-dx, -dy, 1.0));
+      vec3 worldNormal = vec3(n.x, n.z, -n.y);          // mesh is rotated to lie flat
+
+      // Matte clay: soft wrapped diffuse from upper left and front, plus ambient.
+      vec3 lightDir = normalize(vec3(-0.55, 0.8, 0.45));
+      float diffuse = clamp((dot(worldNormal, lightDir) + 0.3) / 1.3, 0.0, 1.0);
+      float ambient = mix(0.22, 0.42, worldNormal.y * 0.5 + 0.5);
+
+      // Cheap cavity darkening: hollows are darker than their surroundings.
+      float around = (heightAt(vec2(6.0, 0.0)) + heightAt(vec2(-6.0, 0.0)) +
+                      heightAt(vec2(0.0, 6.0)) + heightAt(vec2(0.0, -6.0))) * 0.25;
+      float cavity = clamp(1.0 - max(around - centre, 0.0) * 0.05, 0.5, 1.0);
+
+      vec3 colour = vec3(0.66, 0.65, 0.63) * (ambient + 0.8 * diffuse) * cavity;
+      gl_FragColor = vec4(pow(colour, vec3(1.0 / 2.2)), 1.0);
+    }`,
+});
+
+const mesh = new THREE.Mesh(new THREE.PlaneGeometry(PLANE, PLANE, 512, 512), material);
+mesh.rotation.x = -Math.PI / 2;
+mesh.frustumCulled = false;
+scene.add(mesh);
+
+function resize() {
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(viewport);
+resize();
+
+// Pushes whichever map the View menu selects into the texture.
+let viewMode = 0;
+function updateTexture() {
+  let data = fine;
+  if (viewMode === 1) {                                  // 256 layer only
+    upscale(upMid, MID, viewBuffer, 2); data = viewBuffer;
+  } else if (viewMode === 2) {                           // 256 + 512 layers
+    upscale(mid, MID, viewBuffer, 2); data = viewBuffer;
+  } else if (viewMode === 3) {                           // channels only, on a flat plane at 20
+    upscale(chanMid, MID, viewBuffer, 2);
+    for (let i = 0; i < viewBuffer.length; i++) viewBuffer[i] = 20 + viewBuffer[i] + chanFine[i];
+    data = viewBuffer;
+  }
+  heightTexture.image.data = data;
+  heightTexture.needsUpdate = true;
+}
+
+
+/* ---------------------------------------------------------------------
+   7. CONTROLS AND MAIN LOOP
+   --------------------------------------------------------------------- */
+
+makeSliders([
+  { key: 'cutoff',       label: 'Channel cutoff radius', min: 2,  max: 16, step: 1,  value: 8 },
+  { key: 'exaggeration', label: 'Height exaggeration',   min: .5, max: 6,  step: .1, value: 2 },
+], $('surfaceSliders'), key => {
+  if (key === 'exaggeration') { uniforms.exaggeration.value = cfg.exaggeration; return; }
+  rebuildAll(); updateTexture();
+});
+
+/* ---------------------------------------------------------------------
+   8. PRESETS
+   Presets set the particle and surface sliders only. They never change the
+   terrain, the terrain sliders, the seed or the iteration count, so you can
+   switch presets on the same terrain, live, mid-run. Press Reset to start
+   the same terrain over. Each preset lists only the settings that differ
+   from the defaults; the rest are reset to their defaults.
+   --------------------------------------------------------------------- */
+
+const DEFAULTS = { ...cfg };
+
+const PRESET_GROUPS = [
+  ['Start', [
+    ['default', 'Default', {}],
+  ]],
+  ['Landforms', [
+    ['peaks', 'Sharp peaks', {
+      spawnFlat: .05, lookRadius: 2, inertia: .4, jitter: 10, capacityPerSlope: 3, maxCapacity: 3,
+      pickupRate: .5, dropRate: .1, brushRadius: 1.5, maxSteps: 128, cutoff: 4 }],
+    ['ridges', 'Mountain ridges', {
+      inertia: .35, jitter: 15, capacityPerSlope: 2.5, maxCapacity: 2.5,
+      pickupRate: .35, dropRate: .2, brushRadius: 2, maxSteps: 96, cutoff: 6 }],
+    ['hills', 'Rolling hills', {
+      lookRadius: 4, inertia: .5, jitter: 25, pickupRate: .15, dropRate: .5,
+      brushRadius: 5, maxSteps: 48, cutoff: 14 }],
+    ['rivers', 'Branching river valleys', {
+      inertia: .5, jitter: 15, capacityPerSlope: 2, pickupRate: .4, dropRate: .2,
+      brushRadius: 2.5, maxSteps: 96 }],
+    ['braided', 'Braided channels', {
+      spawnFlat: .005, lookRadius: 2, inertia: .1, jitter: 40, capacityPerSlope: 2,
+      pickupRate: .4, dropRate: .6, brushRadius: 2, maxSteps: 128, cutoff: 6 }],
+    ['canyons', 'Canyons', {
+      lookRadius: 2, inertia: .7, jitter: 5, capacityPerSlope: 3, maxCapacity: 3,
+      pickupRate: .6, dropRate: .1, brushRadius: 2, maxSteps: 160, cutoff: 6 }],
+    ['badlands', 'Badlands (dense gullies)', {
+      spawnFlat: .03, lookRadius: 2, inertia: .2, jitter: 25, capacityPerSlope: 2, maxCapacity: 2,
+      pickupRate: .5, dropRate: .15, brushRadius: 1.5, cutoff: 5 }],
+    ['fans', 'Alluvial fans and plains', {
+      spawnFlat: .01, jitter: 30, capacityPerSlope: .6, maxCapacity: .6,
+      pickupRate: .2, dropRate: .7, brushRadius: 4, maxSteps: 96, cutoff: 12 }],
+  ]],
+  ['Erosion strength', [
+    ['weathering', 'Gentle weathering', {
+      jitter: 25,
+      pickupRate: .1, dropRate: .4, brushRadius: 4, maxSteps: 48, cutoff: 12 }],
+    ['heavy', 'Heavy erosion', {
+      capacityPerSlope: 3, maxCapacity: 3,
+      pickupRate: .6, dropRate: .2, maxSteps: 160 }],
+  ]],
+  ['Utility', [
+    ['fast', 'Fast preview', { lookSamples: 6, brushRadius: 2, maxSteps: 24 }],
+  ]],
+];
+
+const PRESET_VALUES = {};
+const presetSelect = $('preset');
+for (const [group, items] of PRESET_GROUPS) {
+  const optgroup = document.createElement('optgroup');
+  optgroup.label = group;
+  for (const [id, name, values] of items) {
+    PRESET_VALUES[id] = values;
+    optgroup.appendChild(new Option(name, id));
+  }
+  presetSelect.appendChild(optgroup);
+}
+presetSelect.value = 'default';
+
+// Sliders that presets never change: terrain, plane size, and the height exaggeration.
+const LOCKED_KEYS = ['baseFreq', 'lacunarity', 'layers', 'roughness', 'height', 'planeSize', 'exaggeration'];
+
+function applyPreset(id) {
+  const values = PRESET_VALUES[id];
+  if (!values) return;                                   // "Custom" is not a preset
+  for (const key in DEFAULTS) {
+    if (LOCKED_KEYS.includes(key)) continue;            // terrain sliders are never touched
+    const { input, readout } = sliderEls[key];
+    input.value = key in values ? values[key] : DEFAULTS[key];
+    cfg[key] = +input.value;                             // read back: the slider may round the value
+    readout.textContent = input.value;
+  }
+  uniforms.exaggeration.value = cfg.exaggeration;
+  rebuildAll(); updateTexture();                         // the cutoff may have changed; the terrain itself is kept
+}
+presetSelect.onchange = () => applyPreset(presetSelect.value);
+
+
+let playing = true, frameIterations = 0, windowStart = performance.now(), iterationsPerSecond = 0;
+const playButton = $('play'), seedInput = $('seed');
+
+function resetSimulation() {
+  generateTerrain(+seedInput.value || 0);
+  timings = [0, 0, 0, 0];
+  updateTexture();
+  frameIterations = 0; iterationsPerSecond = 0; windowStart = performance.now();
+}
+
+playButton.onclick = () => { playing = !playing; playButton.textContent = playing ? 'Pause' : 'Play'; };
+$('step').onclick = () => { playing = false; playButton.textContent = 'Play'; runIteration(); updateTexture(); };
+$('reset').onclick = resetSimulation;
+seedInput.onchange = resetSimulation;
+$('viewMode').onchange = e => { viewMode = +e.target.value; updateTexture(); };
+
+function frame() {
+  requestAnimationFrame(frame);
+
+  if (playing) {
+    // Run iterations for about 12 ms (at least one), then draw.
+    const start = performance.now();
+    do { runIteration(); frameIterations++; } while (performance.now() - start < 12);
+    updateTexture();
+
+    const now = performance.now();
+    if (now - windowStart > 700) {
+      iterationsPerSecond = frameIterations / ((now - windowStart) / 1000);
+      frameIterations = 0; windowStart = now;
+    }
+  }
+
+  statsEl.textContent =
+    'iteration ' + iteration + (playing && iterationsPerSecond ? '  |  ' + iterationsPerSecond.toFixed(1) + ' per second' : '') +
+    '\n256: ' + timings[0].toFixed(0) + ' ms  512: ' + timings[1].toFixed(0) +
+    ' ms  1024: ' + timings[2].toFixed(0) + ' ms  rebuilds: ' + timings[3].toFixed(0) + ' ms';
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+resetSimulation();
+frame();
+</script>
+</body>
+</html>
